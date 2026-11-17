@@ -4,6 +4,7 @@
 import argparse
 import ast
 import difflib
+import hashlib
 import json
 import os.path as osp
 import re
@@ -70,6 +71,10 @@ Produce the YAML output list using these exact testpoint identifiers, in this ex
 """
 
 NED_MATCH_THRESHOLD = 0.1
+
+# Hashed into every result, so an edit to the judge prompts, the response parsing or the judge
+# request settings (temperature, max_tokens) stops an older result from being reused.
+SCORER_SOURCE_FILES = (osp.abspath(__file__), osp.join(osp.dirname(osp.abspath(__file__)), "utils.py"))
 
 
 def compute_ned(a: str, b: str) -> float:
@@ -319,6 +324,68 @@ def print_stats_from_json(score_final: dict, input_folder: str, result_path: str
     print(f"\n{score_text}")
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_run_identity(
+    image_folder: Path, prompt_file: Path, image_paths: list[Path], args: argparse.Namespace
+) -> dict:
+    """Describe the inputs a result is scored from, so a later run can tell whether it may reuse it.
+
+    The gateway API key is never recorded.
+    """
+    images_digest = hashlib.sha256()
+    for image_path in sorted(image_paths, key=lambda p: p.name):
+        images_digest.update(f"{image_path.name}:{sha256_file(image_path)}\n".encode())
+    return {
+        "image_folder": str(image_folder),
+        "extension": args.extension,
+        "image_count": len(image_paths),
+        "images_sha256": images_digest.hexdigest(),
+        "benchmark_prompt_json": str(prompt_file),
+        "benchmark_prompt_sha256": sha256_file(prompt_file),
+        "judge_model": args.modelstr,
+        "gateway_url": args.gateway_url.rstrip("/"),
+        "scorer_prompt_sha256": hashlib.sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest(),
+        "scorer_source_sha256": {osp.basename(path): sha256_file(Path(path)) for path in SCORER_SOURCE_FILES},
+    }
+
+
+def load_matching_result(result_path: Path, run_identity: dict) -> Optional[dict]:
+    """Return the saved result at result_path if it was scored from run_identity, or None if there is none.
+
+    Exits instead of reusing a result scored from other inputs, or one written before the scorer
+    recorded its inputs, so stale scores are never reported for the requested run.
+    """
+    if not result_path.exists():
+        return None
+    score_final = json.loads(result_path.read_text())
+    rescore_hint = "Delete it or pass a different --output_score_json to score again."
+    saved_identity = score_final.get("run_identity")
+    if not isinstance(saved_identity, dict):
+        raise SystemExit(
+            f"Existing results at {result_path} do not record which inputs they were scored from "
+            f"(written by an older scorer), so they cannot be reused. {rescore_hint}"
+        )
+    mismatches = [
+        f"  {key}: saved {saved_identity.get(key)!r}, requested {value!r}"
+        for key, value in run_identity.items()
+        if saved_identity.get(key) != value
+    ]
+    if mismatches:
+        raise SystemExit(
+            f"Existing results at {result_path} were scored from different inputs:\n"
+            + "\n".join(mismatches)
+            + f"\n{rescore_hint}"
+        )
+    return score_final
+
+
 def main() -> None:
     args = parse_arguments()
 
@@ -337,12 +404,6 @@ def main() -> None:
         tablefmt="simple",
     )
     print(f"\nParams:\n{params_disp}")
-
-    if result_path.exists():
-        print(f"Found existing results at {result_path}, skipping scoring")
-        score_final = json.loads(result_path.read_text())
-        print_stats_from_json(score_final, str(image_folder), str(result_path))
-        return
 
     benchmark_data = json.loads(prompt_file.read_text())
     if isinstance(benchmark_data, dict) and "benchmark" in benchmark_data:
@@ -375,6 +436,13 @@ def main() -> None:
     if missing_images:
         print(f"Missing {missing_images} expected image(s) under {image_folder}")
     print(f"Total samples: {samples_total}")
+
+    run_identity = build_run_identity(image_folder, prompt_file, [s["image_path"] for s in samples_todo], args)
+    score_final = load_matching_result(result_path, run_identity)
+    if score_final is not None:
+        print(f"Found existing results for the same inputs at {result_path}, skipping scoring")
+        print_stats_from_json(score_final, str(image_folder), str(result_path))
+        return
 
     vlm = GatewayVLM(
         gateway_url=args.gateway_url,
@@ -442,6 +510,7 @@ def main() -> None:
             "all": compute_final_metrics(score_breakdown, verbose=False),
         },
         "judge_model": args.modelstr,
+        "run_identity": run_identity,
         "success_count": f"{len(score_breakdown)}/{samples_total}",
         "breakdown": score_breakdown,
     }
